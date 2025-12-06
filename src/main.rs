@@ -2,7 +2,7 @@ use clap::Parser;
 use gst::prelude::*;
 use gst_app::AppSrc;
 use gst_video::VideoInfo;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn, debug};
@@ -31,7 +31,7 @@ struct Args {
     #[arg(long, default_value = "RGBx")]
     format: String,
 
-    /// 输出方式：none（默认，不输出）、appsrc（通过 appsrc 暴露到 UDP）、rtsp（RTSP 服务器）
+    /// 输出方式：none（默认，不输出）、appsrc（通过 appsrc 暴露到 UDP）、rtsp（RTSP 服务器）、vnc（VNC 服务器）
     #[arg(long, default_value = "none")]
     output: String,
 
@@ -46,6 +46,14 @@ struct Args {
     /// RTSP 服务器端口（当 output=rtsp 时使用）
     #[arg(long, default_value_t = 8554)]
     rtsp_port: u16,
+
+    /// VNC 服务器端口（当 output=vnc 时使用）
+    #[arg(long, default_value_t = 5900)]
+    vnc_port: u16,
+
+    /// VNC 密码（当 output=vnc 时使用，留空则不设置密码）
+    #[arg(long)]
+    vnc_password: Option<String>,
 }
 
 fn main() {
@@ -117,10 +125,16 @@ fn main() {
     // 设置视频信息（这会创建输出）
     display.set_video_info(GstVideoInfo::RAW(video_info.clone()));
 
-    // 根据输出选项创建相应的 GStreamer pipeline
+    // 根据输出选项创建相应的输出
     let (stop_tx, stop_rx) = mpsc::channel();
 
-    let (appsrc_opt, frame_stop_tx) = match args.output.as_str() {
+    // 区分不同的输出类型
+    enum OutputType {
+        AppSrc(AppSrc, mpsc::Sender<()>),
+        Vnc(Arc<Mutex<rustvncserver::VncServer>>, mpsc::Sender<()>),
+    }
+
+    let output_opt = match args.output.as_str() {
         "appsrc" => {
             info!("使用 appsrc 方式暴露输出流到 {}: {}", args.protocol.to_uppercase(), args.output_address);
             match start_appsrc_output(
@@ -128,7 +142,7 @@ fn main() {
                 args.output_address.clone(),
                 args.protocol.as_str(),
             ) {
-                Ok((appsrc, tx)) => (Some(appsrc), Some(tx)),
+                Ok((appsrc, tx)) => Some(OutputType::AppSrc(appsrc, tx)),
                 Err(e) => {
                     error!("无法启动输出流: {}", e);
                     eprintln!("错误: {}", e);
@@ -140,11 +154,26 @@ fn main() {
             info!("使用 RTSP 服务器暴露输出流，端口: {}", args.rtsp_port);
             warn!("RTSP 服务器功能尚未实现，请使用 --output appsrc");
             // TODO: 实现 RTSP 服务器
-            (None, None)
+            None
+        }
+        "vnc" => {
+            info!("使用 VNC 服务器暴露输出流，端口: {}", args.vnc_port);
+            match start_vnc_output(
+                video_info.clone(),
+                args.vnc_port,
+                args.vnc_password.clone(),
+            ) {
+                Ok((vnc_server, tx)) => Some(OutputType::Vnc(vnc_server, tx)),
+                Err(e) => {
+                    error!("无法启动 VNC 服务器: {}", e);
+                    eprintln!("错误: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {
-            info!("未启用输出流暴露（使用 --output appsrc 或 --output rtsp 启用）");
-            (None, None)
+            info!("未启用输出流暴露（使用 --output appsrc、--output rtsp 或 --output vnc 启用）");
+            None
         }
     };
 
@@ -152,19 +181,22 @@ fn main() {
     info!("按 Ctrl+C 退出");
 
     // 设置 Ctrl+C 处理器
-    let frame_stop_tx_clone = frame_stop_tx.clone();
+    let output_opt_clone = output_opt.clone();
     ctrlc::set_handler(move || {
         info!("收到退出信号，正在关闭...");
         let _ = stop_tx.send(());
         // 如果启用了输出流，也通知帧推送线程停止
-        if let Some(ref tx) = frame_stop_tx_clone {
+        if let Some(OutputType::AppSrc(_, ref tx)) = output_opt_clone {
+            let _ = tx.send(());
+        } else if let Some(OutputType::Vnc(_, ref tx)) = output_opt_clone {
             let _ = tx.send(());
         }
     })
     .expect("无法设置 Ctrl+C 处理器");
 
     // 主循环：如果启用了输出流，在主循环中获取帧并推送
-    if let Some(ref appsrc) = appsrc_opt {
+    match output_opt {
+        Some(OutputType::AppSrc(ref appsrc, _)) => {
         let target_frame_duration = Duration::from_secs_f64(1.0 / video_info.fps().numer() as f64);
         let mut frame_count = 0u64;
         let start_time = Instant::now();
@@ -208,11 +240,56 @@ fn main() {
             thread::sleep(target_frame_duration);
         }
 
-        // 发送 EOS
-        let _ = appsrc.end_of_stream();
-    } else {
-        // 未启用输出流，直接等待退出信号
-        stop_rx.recv().unwrap();
+            // 发送 EOS
+            let _ = appsrc.end_of_stream();
+        }
+        Some(OutputType::Vnc(ref vnc_server, _)) => {
+            let target_frame_duration = Duration::from_secs_f64(1.0 / video_info.fps().numer() as f64);
+            let mut frame_count = 0u64;
+            let start_time = Instant::now();
+
+            loop {
+                // 检查是否收到停止信号（带超时，避免阻塞）
+                match stop_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(_) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // 超时是正常的，继续处理帧
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                // 获取帧并发送到 VNC 服务器
+                match display.frame() {
+                    Ok(buffer) => {
+                        if let Err(e) = send_frame_to_vnc(vnc_server, &buffer, &video_info) {
+                            error!("发送帧到 VNC 服务器失败: {:?}", e);
+                        } else {
+                            frame_count += 1;
+                            if frame_count % 60 == 0 {
+                                let elapsed = start_time.elapsed();
+                                let fps = frame_count as f64 / elapsed.as_secs_f64();
+                                debug!("已发送 {} 帧到 VNC，平均帧率: {:.2} fps", frame_count, fps);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("Flushing") || err_str.contains("Eos") {
+                            info!("正在关闭: {:?}", e);
+                            break;
+                        }
+                        warn!("获取帧失败: {:?}，继续尝试...", e);
+                    }
+                }
+
+                // 控制帧率
+                thread::sleep(target_frame_duration);
+            }
+        }
+        None => {
+            // 未启用输出流，直接等待退出信号
+            stop_rx.recv().unwrap();
+        }
     }
 
     info!("正在清理资源...");
@@ -370,4 +447,150 @@ fn start_appsrc_output(
     // 返回 appsrc 和停止信号发送端（暂时不使用，因为我们在主循环中处理）
     let (frame_stop_tx, _frame_stop_rx) = mpsc::channel();
     Ok((appsrc, frame_stop_tx))
+}
+
+/// 使用 VNC 服务器方式暴露输出流
+/// 返回 VNC 服务器和停止信号的发送端
+/// 注意：frame() 必须在创建 WaylandDisplay 的线程中调用
+fn start_vnc_output(
+    video_info: VideoInfo,
+    vnc_port: u16,
+    vnc_password: Option<String>,
+) -> Result<(Arc<Mutex<rustvncserver::VncServer>>, mpsc::Sender<()>), String> {
+    use rustvncserver::VncServer;
+
+    let width = video_info.width() as u16;
+    let height = video_info.height() as u16;
+    let name = "weadless".to_string();
+    let password = vnc_password.clone();
+
+    // 创建 VNC 服务器（异步 API，需要在 tokio runtime 中运行）
+    let (vnc_server, mut event_rx) = VncServer::new(width, height, name, password);
+
+    // 在单独的线程中运行 VNC 服务器
+    let server_clone = Arc::new(Mutex::new(vnc_server));
+    let server_for_listen = server_clone.clone();
+    let port = vnc_port;
+
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("无法创建 tokio runtime: {:?}", e))
+            .unwrap();
+
+        rt.block_on(async {
+            // 处理服务器事件
+            let event_handle = tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        rustvncserver::ServerEvent::ClientConnected { id, address } => {
+                            info!("VNC 客户端 {} ({}) 已连接", id, address);
+                        }
+                        rustvncserver::ServerEvent::ClientDisconnected { id } => {
+                            info!("VNC 客户端 {} 已断开", id);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            // 启动服务器
+            let server = server_for_listen.lock().unwrap();
+            if let Err(e) = server.listen(port).await {
+                error!("VNC 服务器监听失败: {:?}", e);
+            }
+
+            event_handle.await.ok();
+        });
+    });
+
+    info!("VNC 服务器已启动");
+    info!("VNC 服务器地址: 0.0.0.0:{}", vnc_port);
+    info!("使用 VNC 客户端连接:");
+    info!("  vncviewer localhost:{}", vnc_port);
+    info!("  或者: vncviewer localhost::{}", vnc_port);
+    if vnc_password.is_some() {
+        info!("  需要密码认证");
+    }
+
+    // 返回 VNC 服务器和停止信号发送端
+    let (frame_stop_tx, _frame_stop_rx) = mpsc::channel();
+    Ok((server_clone, frame_stop_tx))
+}
+
+/// 将 GStreamer buffer 发送到 VNC 服务器
+fn send_frame_to_vnc(
+    vnc_server: &Arc<Mutex<rustvncserver::VncServer>>,
+    buffer: &gst::Buffer,
+    video_info: &VideoInfo,
+) -> Result<(), String> {
+    // 获取 buffer 的数据
+    let map = buffer
+        .map_readable()
+        .map_err(|e| format!("无法映射 buffer: {:?}", e))?;
+
+    let data = map.as_slice();
+    let width = video_info.width() as usize;
+    let height = video_info.height() as usize;
+
+    // 根据视频格式处理数据
+    // VNC 需要 RGB888 格式（每个像素 3 字节）
+    let rgb_data = match video_info.format() {
+        gst_video::VideoFormat::Rgbx => {
+            // RGBx -> RGB (去掉 alpha 通道)
+            let mut rgb = Vec::with_capacity(width * height * 3);
+            for chunk in data.chunks_exact(4) {
+                rgb.push(chunk[0]); // R
+                rgb.push(chunk[1]); // G
+                rgb.push(chunk[2]); // B
+            }
+            rgb
+        }
+        gst_video::VideoFormat::Rgba => {
+            // RGBA -> RGB (去掉 alpha 通道)
+            let mut rgb = Vec::with_capacity(width * height * 3);
+            for chunk in data.chunks_exact(4) {
+                rgb.push(chunk[0]); // R
+                rgb.push(chunk[1]); // G
+                rgb.push(chunk[2]); // B
+            }
+            rgb
+        }
+        gst_video::VideoFormat::Bgrx => {
+            // BGRx -> RGB (交换 R 和 B，去掉 alpha)
+            let mut rgb = Vec::with_capacity(width * height * 3);
+            for chunk in data.chunks_exact(4) {
+                rgb.push(chunk[2]); // R
+                rgb.push(chunk[1]); // G
+                rgb.push(chunk[0]); // B
+            }
+            rgb
+        }
+        gst_video::VideoFormat::Bgra => {
+            // BGRA -> RGB (交换 R 和 B，去掉 alpha)
+            let mut rgb = Vec::with_capacity(width * height * 3);
+            for chunk in data.chunks_exact(4) {
+                rgb.push(chunk[2]); // R
+                rgb.push(chunk[1]); // G
+                rgb.push(chunk[0]); // B
+            }
+            rgb
+        }
+        _ => {
+            return Err(format!(
+                "不支持的视频格式: {:?}，VNC 需要 RGB 格式",
+                video_info.format()
+            ));
+        }
+    };
+
+    // 发送帧到 VNC 服务器
+    let mut server = vnc_server
+        .lock()
+        .map_err(|e| format!("无法锁定 VNC 服务器: {:?}", e))?;
+
+    server
+        .update_framebuffer(0, 0, width as u16, height as u16, &rgb_data)
+        .map_err(|e| format!("无法更新 VNC 帧缓冲区: {:?}", e))?;
+
+    Ok(())
 }
